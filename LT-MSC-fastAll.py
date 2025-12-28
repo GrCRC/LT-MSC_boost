@@ -4,132 +4,171 @@ import time
 import os
 import sys
 import gc
+import psutil
 from scipy.linalg import solve
 from sklearn.utils.extmath import randomized_svd
 
-import psutil
-import os
-
-
-# === 新增内存监控辅助函数 ===
-def print_memory_usage(tag=""):
-    """
-    打印当前进程占用的物理内存 (RSS)
-    """
-    process = psutil.Process(os.getpid())
-    mem_info = process.memory_info()
-    # 将字节转换为 GB
-    mem_gb = mem_info.rss / 1024 / 1024 / 1024
-    print(f"[{tag}] Current Memory: {mem_gb:.2f} GB")
 
 # ==========================================
-# 核心算法实现部分 (优化版)
+# 内存监控工具
+# ==========================================
+def print_memory_usage(tag=""):
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    mem_gb = mem_info.rss / 1024 / 1024 / 1024
+    print(f"[{tag}] Current Memory: {mem_gb:.2f} GB")
+    sys.stdout.flush()
+
+
+# ==========================================
+# 核心算法实现部分 (极大内存优化版)
 # ==========================================
 
 def solve_l1l2(W, lambda_val):
     """
-    求解 L1/L2 范数最小化问题: min lambda |E|_2,1 + |E - W|_F^2
+    求解 L1/L2 范数最小化问题
     """
-    # 确保输入是 float32
     W = W.astype(np.float32)
-    E = np.zeros_like(W, dtype=np.float32)
-
-    # 计算每一列的 L2 范数
+    # W is (D, N), D is small (e.g. 2048), N is 50000.
+    # This takes ~400MB. Safe to compute directly.
     wnorms = np.linalg.norm(W, axis=0)
-
-    # 软阈值操作
     scale = np.maximum(0, wnorms - lambda_val) / (wnorms + 1e-10)
-
-    # 将 scale 广播到每一列
     E = W * scale[np.newaxis, :]
     return E
 
 
-def softth_randomized(F, lambda_val, n_components=300):
+def compute_shrinkage_operator(Z_tensor, W_tensor, rho, N, K, chunk_size=5000):
     """
-    使用随机化 SVD 进行加速的软阈值操作
+    计算 Soft Thresholding 的核心收缩算子 T (3x3矩阵)。
+    避免显式构造巨大的 (N*N, K) 矩阵。
     """
-    if F.shape[0] > 2000 or F.shape[1] > 2000:
-        # 大矩阵使用 Randomized SVD
-        U, S, Vt = randomized_svd(F, n_components=n_components, random_state=42)
-    else:
-        # 小矩阵使用普通 SVD
-        U, S, Vt = np.linalg.svd(F, full_matrices=False)
+    # 逻辑：
+    # 设 M_tall 为 (N^2, K) 的矩阵，其中每一行对应 tensor 在 (i,j) 位置的 fiber: z + w/rho
+    # 我们需要对 M_tall^T (K, N^2) 做 Soft Thresholding。
+    # 设 M_tall^T = U S V^T (这里 U 是 KxK, S 是 K, V 是 N^2 x K)
+    # 阈值操作后: G_tall^T = U * thresh(S) * V^T
+    # 变换为右乘形式: G_tall = M_tall * T
+    # 其中 T = V S^{-1} thresh(S) V^T (不对，推导见下)
 
-    S_thresh = np.maximum(0, S - lambda_val)
+    # 正确推导:
+    # M_tall = Q Sigma P^T (SVD of M_tall, Q is N^2xK, P is KxK)
+    # M_tall^T = P Sigma Q^T.
+    # SoftTh(M_tall^T) = P thresh(Sigma) Q^T.
+    # Target G_tall = (P thresh(Sigma) Q^T)^T = Q thresh(Sigma) P^T.
+    # 我们有 M_tall = Q Sigma P^T => Q = M_tall P Sigma^{-1}
+    # 代入: G_tall = (M_tall P Sigma^{-1}) thresh(Sigma) P^T
+    #              = M_tall * [P * diag(thresh(sigma)/sigma) * P^T]
+    # 令 T = P * diag(thresh(sigma)/sigma) * P^T
+    # 这是一个 K x K 的矩阵。
 
-    # 如果所有奇异值都被截断，直接返回零矩阵
-    idx = S_thresh > 0
-    if np.sum(idx) == 0:
-        return np.zeros_like(F)
+    # 1. 计算 M_tall^T @ M_tall (即协方差矩阵，K x K)
+    #    M_tall = Z_flat + W_flat/rho
+    MMt = np.zeros((K, K), dtype=np.float32)
 
-    U = U[:, idx]
-    S_thresh = S_thresh[idx]
-    Vt = Vt[idx, :]
+    # 使用分块累加，避免分配 N^2 x K 的大矩阵
+    total_elements = N * N
 
-    # 重构矩阵: (U * S) @ Vt，注意顺序以优化速度
-    E = (U * S_thresh) @ Vt
-    return E.astype(np.float32)
+    # Z_tensor 在内存中是 (N, N, K)，展平最后两维比较麻烦，但我们只需要视为 (N*N, K)
+    # 由于 K 在最后，reshape(-1, K) 对于 C-order 是零拷贝视图！
+    Z_flat = Z_tensor.reshape(-1, K)
+    W_flat = W_tensor.reshape(-1, K)
+
+    for i in range(0, total_elements, chunk_size):
+        end = min(i + chunk_size, total_elements)
+        # 获取切片 (Chunk, K)
+        z_chunk = Z_flat[i:end, :]
+        w_chunk = W_flat[i:end, :]
+
+        # m_chunk = z + w/rho
+        m_chunk = z_chunk + w_chunk * (1.0 / rho)
+
+        # 累加 KxK
+        MMt += np.dot(m_chunk.T, m_chunk)
+
+        del m_chunk, z_chunk, w_chunk
+
+    # 2. 对 KxK 矩阵做特征分解 (Eigendecomposition)
+    # MMt = P Sigma^2 P^T
+    evals, P = np.linalg.eigh(MMt)
+
+    # 特征值可能有些微负值（数值误差），修正为0
+    evals = np.maximum(0, evals)
+    sigmas = np.sqrt(evals)
+
+    # 3. 计算收缩系数
+    # lambda = 1/rho
+    thresh_val = 1.0 / rho
+    sigmas_thresholded = np.maximum(0, sigmas - thresh_val)
+
+    # 处理除零 (如果 sigma=0, scale=0)
+    scale = np.zeros_like(sigmas)
+    nonzero_idx = sigmas > 1e-10
+    scale[nonzero_idx] = sigmas_thresholded[nonzero_idx] / sigmas[nonzero_idx]
+
+    # 4. 构造 T 矩阵 (K x K)
+    # T = P * diag(scale) * P^T
+    T = np.dot(P * scale, P.T)
+
+    return T.astype(np.float32)
 
 
-def update_tensor_variables(WT, Z_tensor, sX, mu, rho):
+def update_tensor_blockwise(Z_tensor, W_tensor, G_tensor, rho, T, chunk_size=100000):
     """
-    更新张量变量 G 和 W
-    对应原始代码中的 updateG_tensor 和 update W 部分
+    分块更新 G 和 W，完全避免大内存分配。
+    G = (Z + W/rho) * T
+    W = W + rho * (Z - G)
     """
-    N, _, K = sX
-    Target = Z_tensor + WT / rho
+    N = Z_tensor.shape[0]
+    K = Z_tensor.shape[2]
+    total_elements = N * N
 
-    # 初始化 G_new
-    G_new = np.zeros(sX, dtype=np.float32)
+    # 获取视图 (View)
+    Z_flat = Z_tensor.reshape(-1, K)
+    W_flat = W_tensor.reshape(-1, K)
+    G_flat = G_tensor.reshape(-1, K)  # 直接修改 G_tensor 的内存
 
-    # 多视图聚类通常关注视图间的一致性 (Mode-3) 和样本自表达 (Mode-1/2)
-    # 这里我们对 Mode-3 (视图维) 进行低秩约束，这是多视图聚类的核心
-    # 将张量沿第3维展开 -> (K, N*N)
+    # 分块处理
+    for i in range(0, total_elements, chunk_size):
+        end = min(i + chunk_size, total_elements)
 
-    # Mode-3 Unfolding
-    # Shape: (K, N*N)
-    mat_mode3 = np.reshape(np.moveaxis(Target, 2, 0), (K, N * N), order='F')
+        # 1. 计算 Target Chunk
+        # target = z + w/rho (分配小内存)
+        target_chunk = Z_flat[i:end, :] + W_flat[i:end, :] * (1.0 / rho)
 
-    # 对 (K, N*N) 矩阵做软阈值。因为 K 很小 (如3)，这里SVD极快
-    mat_th = softth_randomized(mat_mode3, 1.0 / rho, n_components=K)
+        # 2. 更新 G Chunk
+        # G = Target * T
+        # 这里的 G_flat[...] 写入直接作用于 G_tensor 原地
+        g_chunk = np.dot(target_chunk, T)
+        G_flat[i:end, :] = g_chunk
 
-    # Fold back to Tensor
-    G_new = np.moveaxis(np.reshape(mat_th, (K, N, N), order='F'), 0, 2)
+        # 3. 更新 W Chunk
+        # W = W + rho * (Z - G)
+        # 直接原地修改 W_tensor
+        # W_flat[i:end, :] += rho * (Z_flat[i:end, :] - g_chunk)
+        # 为了更省内存，逐步计算
+        diff = Z_flat[i:end, :] - g_chunk
+        W_flat[i:end, :] += diff * rho
 
-    # 如果内存允许，也可以加入 Mode-1 的约束（对应样本相关性），但对内存要求极高
-    # 下面注释掉的代码是 Mode-1 的实现，如果内存不足 128G 建议不要开启
-    """
-    # Mode-1 Unfolding: (N, N*K) -> Huge Matrix!
-    mat_mode1 = np.reshape(np.moveaxis(Target, 0, 0), (N, N*K), order='F')
-    mat_th1 = softth_randomized(mat_mode1, 1.0/rho, n_components=300)
-    G_mode1 = np.moveaxis(np.reshape(mat_th1, (N, N, K), order='F'), 0, 0)
-    G_new = (G_new + G_mode1) / 2.0
-    """
+        del target_chunk, g_chunk, diff
 
-    # 更新对偶变量 W
-    # W = W + rho * (Z - G)
-    W_new = WT + rho * (Z_tensor - G_new)
-
-    return G_new, W_new
+    # 强制垃圾回收
+    gc.collect()
 
 
 def lt_msc(X_list, gt, lambda_val):
-    """
-    LT-MSC 主函数 (优化内存版)
-    """
-    # 1. 强制转换为 Float32
+    # 1. 基础配置
     X = [x.astype(np.float32) for x in X_list]
-    print_memory_usage("Start")
-
     V_num = len(X)
     N = X[0].shape[1]
     D_list = [x.shape[0] for x in X]
 
     print(f"[Init] Dataset: N={N}, Views={V_num}, Dims={D_list}")
-    print(f"[Init] Estimated Z-Tensor Size: {N * N * V_num * 4 / 1024 ** 3:.2f} GB")
+    print_memory_usage("Start")
 
-    # 2. 初始化变量 (Float32)
+    # 2. 内存分配 (Peak Memory Point 1)
+    # 此时约占用 9.3GB * 3 * 3 (Z,G,W) = 84GB
+    # 加上数据本身，已经接近 90GB，但这是静态的，不会增长。
+    print("Allocating Tensors...")
     Z_tensor = np.zeros((N, N, V_num), dtype=np.float32)
     G_tensor = np.zeros((N, N, V_num), dtype=np.float32)
     W_tensor = np.zeros((N, N, V_num), dtype=np.float32)
@@ -137,14 +176,14 @@ def lt_msc(X_list, gt, lambda_val):
     E = [np.zeros((d, N), dtype=np.float32) for d in D_list]
     Y = [np.zeros((d, N), dtype=np.float32) for d in D_list]
 
-    print_memory_usage("After Init")
+    print_memory_usage("After Alloc")
 
-    # 3. 预计算 Woodbury 矩阵 XX^T (D x D)，避免计算 N x N
+    # 3. Woodbury 预计算
     XXt_list = []
     for v in range(V_num):
         XXt_list.append(X[v] @ X[v].T)
 
-    # 参数设置
+    # 参数
     max_iter = 50
     rho = 1e-4
     max_rho = 1e10
@@ -163,55 +202,35 @@ def lt_msc(X_list, gt, lambda_val):
         iter_start = time.time()
         max_diff = 0
 
-        # --- 1. Update Z (使用 Woodbury 恒等式) ---
+        # --- 1. Update Z (Woodbury) ---
         for k in range(V_num):
-            # 目标方程: (alpha * I + X'X) Z = RHS
-            # RHS = X'(Y/mu + X - E) + alpha*G - alpha*W/mu
-
-            # Step A: 构建 RHS (Right Hand Side)
             M = Y[k] / mu + X[k] - E[k]
-
-            # 注意：这里 X[k].T @ M 会生成一个 N x N 的稠密矩阵
-            # 这是内存消耗的峰值点之一。由于 Z_tensor 本身就是 N x N，这是不可避免的。
+            # 这里会生成一个 9.3GB 的 RHS 矩阵，是瞬时内存峰值
+            # 必须确保在循环末尾释放
             RHS = np.dot(X[k].T, M)
-            del M  # 及时释放
+            del M
 
             alpha = rho / mu
             RHS += alpha * G_tensor[:, :, k]
             RHS -= (1.0 / mu) * W_tensor[:, :, k]
 
-            # Step B: Woodbury 求逆核心 (D x D)
-            # inv(alpha*I + X'X) = 1/alpha * (I - X' * inv(alpha*I + XX') * X)
-
-            # Core inverse: (alpha*I + XX')
+            # Woodbury Inverse
             woodbury_core = XXt_list[k] + alpha * np.eye(D_list[k], dtype=np.float32)
+            X_RHS = np.dot(X[k], RHS)  # (D, N)
 
-            # Step C: 计算修正项
-            # temp = inv(core) * (X * RHS)
-            # X * RHS -> (D x N)
-            X_RHS = np.dot(X[k], RHS)
-
-            # Solve linear system instead of explicit inverse
             temp_D_N = solve(woodbury_core, X_RHS, assume_a='pos')
             del X_RHS
 
-            # correction = X' * temp
-            correction = np.dot(X[k].T, temp_D_N)
+            correction = np.dot(X[k].T, temp_D_N)  # (N, N) - 9.3GB
             del temp_D_N
 
-            # Final Z
-            Z_new = (RHS - correction) / alpha
+            # Update Z slice in-place
+            Z_tensor[:, :, k] = (RHS - correction) / alpha
+
             del RHS, correction
+            gc.collect()  # 关键：释放 RHS 和 correction 占用的 ~18GB
 
-            # 更新 Z_tensor
-            Z_tensor[:, :, k] = Z_new
-            del Z_new
-
-            # 强制垃圾回收
-            gc.collect()
-
-        # 在 Z 更新完后查看内存，确认是否释放回落
-        print_memory_usage(f"Iter {iter_idx} - After Z Update")
+        # print_memory_usage(f"Iter {iter_idx} - After Z")
 
         # --- 2. Update E ---
         for k in range(V_num):
@@ -226,33 +245,39 @@ def lt_msc(X_list, gt, lambda_val):
             Y[k] += mu * (X[k] - XZ - E[k])
             del XZ
 
-        # --- 4. Update G and W (Tensor Constraints) ---
-        G_new, W_new = update_tensor_variables(W_tensor, Z_tensor, (N, N, V_num), mu, rho)
+        # --- 4. Update G and W (Block-wise Streaming) ---
+        # 这一步彻底重构，不再分配大内存
 
-        # 检查收敛性 (采样近似，避免全量计算)
-        idx = np.random.randint(0, N, 2000)
-        diff_g = np.max(np.abs(G_tensor[idx, :, :] - G_new[idx, :, :]))
+        # 4.1 计算收缩算子 T (K x K)
+        T_matrix = compute_shrinkage_operator(Z_tensor, W_tensor, rho, N, V_num)
+
+        # 4.2 记录 G 的旧值用于收敛检查 (只采样，不全量拷贝)
+        idx_sample = np.random.randint(0, N, 2000)
+        G_old_sample = G_tensor[idx_sample, :, :].copy()
+
+        # 4.3 流式更新 G 和 W
+        update_tensor_blockwise(Z_tensor, W_tensor, G_tensor, rho, T_matrix)
+
+        # 检查收敛性 (Approx)
+        G_new_sample = G_tensor[idx_sample, :, :]
+        diff_g = np.max(np.abs(G_old_sample - G_new_sample))
         max_diff = max(max_diff, diff_g)
+        del G_old_sample, G_new_sample
 
-        G_tensor = G_new
-        W_tensor = W_new
-        del G_new, W_new
-
-        print_memory_usage(f"Iter {iter_idx} - End")  # <--- 监控点 3：迭代结束
+        print_memory_usage(f"Iter {iter_idx} - End")
 
         # --- Update Params ---
         iter_idx += 1
         mu = min(mu * pho_mu, max_mu)
         rho = min(rho * pho_rho, max_rho)
 
-        print(f"Iter {iter_idx}: Max Diff (Approx) = {max_diff:.6f}, Time = {time.time() - iter_start:.2f}s")
+        print(f"Iter {iter_idx}: Max Diff = {max_diff:.6f}, Time = {time.time() - iter_start:.2f}s")
         sys.stdout.flush()
 
         if max_diff < epsilon and iter_idx > 15:
             is_converged = True
 
-    # --- 构建相似度矩阵 ---
-    print("Optimization Done. Building Affinity Matrix...")
+    print("Building Affinity Matrix...")
     S = np.zeros((N, N), dtype=np.float32)
     for k in range(V_num):
         S += np.abs(Z_tensor[:, :, k]) + np.abs(Z_tensor[:, :, k].T)
@@ -261,134 +286,56 @@ def lt_msc(X_list, gt, lambda_val):
 
 
 # ==========================================
-# 数据加载与主程序 (复刻 ye.py)
+# 主程序
 # ==========================================
-
 if __name__ == "__main__":
-    # 添加当前目录到路径
     sys.path.append(os.getcwd())
 
-    # --------------------------------------------------------
-    # 配置部分：根据 ye.py 的逻辑设置数据集
-    # --------------------------------------------------------
-    # 你可以修改这里的路径指向你的实际文件
-    # 示例假设使用 cifar100 (结构类似 cifar10)
+    # 模拟/加载数据
+    # 请确保路径正确
+    file_path = '../data/cifar100.mat'
     dataName = "Cifar100"
-    file_path = '../data/cifar100.mat'  # 请修改为你的真实路径，例如 'cifar10.mat'
 
     print(f"Loading data from {file_path}...")
-
-    try:
-        mat_dict = sio.loadmat(file_path)
-    except FileNotFoundError:
-        print(f"Error: File not found at {file_path}")
-        print("Please check the file path.")
-        sys.exit(1)
-
-    # 按照 ye.py 的读取逻辑
-    # 假设 .mat 文件结构包含 'data' 和 'truelabel'
-    # 注意：根据 ye.py，raw_data 是一个 cell array (object array in numpy)
-    if 'data' in mat_dict:
-        raw_data = mat_dict['data']
-        # 解析数据: ye.py 中使用了 raw_data[0,0], raw_data[1,0]...
-        # 这通常意味着 MATLAB 中的 data{1}, data{2}...
-        # 我们这里动态读取所有视图
-
-        # 检查 raw_data 的形状
-        if raw_data.shape[0] > raw_data.shape[1]:
-            # 如果是 (V, 1) 的形状
-            num_views_data = raw_data.shape[0]
-            x = [raw_data[v, 0] for v in range(num_views_data)]
-        else:
-            # 如果是 (1, V) 的形状
-            num_views_data = raw_data.shape[1]
-            x = [raw_data[0, v] for v in range(num_views_data)]
-
-        # 标签处理
-        if 'truelabel' in mat_dict:
-            y = mat_dict['truelabel'].flatten()
-        elif 'gt' in mat_dict:
-            y = mat_dict['gt'].flatten()
-        else:
-            # 尝试寻找其他可能的标签键名
-            print("Warning: Label key not found (truelabel/gt). Using dummy labels.")
-            y = np.zeros(x[0].shape[1])
-
+    if not os.path.exists(file_path):
+        print("File not found. Generating Dummy Data for test...")
+        # 生成假数据测试内存
+        N_test = 50000
+        V_test = 3
+        X = [np.random.randn(512, N_test).astype(np.float32) for _ in range(V_test)]
+        gt = np.random.randint(0, 10, N_test)
     else:
-        # 兼容其他格式 (如 Hdigit / scene)
-        # 尝试直接查找 X1, X2...
-        x = []
-        i = 1
-        while f'X{i}' in mat_dict or f'x{i}' in mat_dict:
-            key = f'X{i}' if f'X{i}' in mat_dict else f'x{i}'
-            data_view = mat_dict[key]
-            # 检查是否需要转置：我们期望 (D, N)
-            # 这是一个启发式检查，通常样本数 N 比较大
-            if data_view.shape[0] > data_view.shape[1]:
-                # 如果是 (N, D)，转置为 (D, N)
-                data_view = data_view.T
-            x.append(data_view)
-            i += 1
-
-        if 'Y' in mat_dict:
-            y = mat_dict['Y'].flatten()
-        elif 'gt' in mat_dict:
-            y = mat_dict['gt'].flatten()
+        mat_dict = sio.loadmat(file_path)
+        if 'data' in mat_dict:
+            raw_data = mat_dict['data']
+            if raw_data.shape[0] > raw_data.shape[1]:
+                x = [raw_data[v, 0] for v in range(raw_data.shape[0])]
+            else:
+                x = [raw_data[0, v] for v in range(raw_data.shape[1])]
+            y = mat_dict['truelabel'].flatten() if 'truelabel' in mat_dict else mat_dict['gt'].flatten()
         else:
-            y = np.zeros(x[0].shape[1])
+            # 简单的 Fallback
+            x = []
+            i = 1
+            while f'X{i}' in mat_dict or f'x{i}' in mat_dict:
+                k = f'X{i}' if f'X{i}' in mat_dict else f'x{i}'
+                d = mat_dict[k]
+                if d.shape[0] > d.shape[1]: d = d.T
+                x.append(d)
+                i += 1
+            y = mat_dict['gt'].flatten() if 'gt' in mat_dict else np.zeros(x[0].shape[1])
 
-    # --------------------------------------------------------
-    # 预处理部分 (复刻 ye.py)
-    # --------------------------------------------------------
+        X = x
+        gt = y
 
-    # 1. 强制转换为 float32 并归一化
-    x = [view.astype(np.float32) for view in x]
+    # 归一化
+    for v in range(len(X)):
+        norms = np.sqrt(np.sum(X[v] ** 2, axis=0)) + 1e-10
+        X[v] = X[v] / norms
 
-    gt = y.flatten()
-    # gt = gt + 1 # Python 索引从 0 开始，通常不需要加 1，除非后续评估代码有要求
-
-    num_views = len(x)
-    print(f"Number of views: {num_views}")
-    print(f"Sample size (N): {x[0].shape[1]}")
-
-    # 归一化 (L2 Norm per column)
-    print("Normalizing data...")
-    for v in range(num_views):
-        # 每一列除以其L2范数
-        norms = np.sqrt(np.sum(x[v] ** 2, axis=0)) + 1e-10
-        x[v] = x[v] / norms
-
-    # --------------------------------------------------------
-    # 执行 LT-MSC
-    # --------------------------------------------------------
-    t1 = time.time()
-
-    lambda_val = 0.1  # 正则化参数
-
-    print(f"Starting LT-MSC with lambda={lambda_val}...")
     try:
-        S = lt_msc(x, gt, lambda_val)
+        S = lt_msc(X, gt, lambda_val=0.1)
+        np.savez(f'W_{dataName}.npz', S=S, gt=gt)
+        print("Done.")
     except MemoryError:
-        print("\n[CRITICAL ERROR] Memory Limit Exceeded.")
-        print("Suggestion: Try reducing the dataset size or running on a machine with >128GB RAM.")
-        sys.exit(1)
-
-    t2 = time.time() - t1
-    print(f"Total Time elapsed: {t2:.2f} seconds")
-
-    # --------------------------------------------------------
-    # 保存结果
-    # --------------------------------------------------------
-    save_path = f'W_{dataName}.npz'
-    print("Saving graph to {}".format(save_path))
-    np.savez(save_path, S=S, gt=gt)
-    print("Save complete.")
-
-    # 如果有对应的聚类评估代码 (spectral clustering)，可以在此处调用
-    # 例如:
-    # from sklearn.cluster import SpectralClustering
-    # from sklearn.metrics import normalized_mutual_info_score, accuracy_score
-    # n_clusters = len(np.unique(gt))
-    # sc = SpectralClustering(n_clusters=n_clusters, affinity='precomputed')
-    # labels = sc.fit_predict(S)
-    # print(f"NMI: {normalized_mutual_info_score(gt, labels)}")
+        print("OOM triggered.")
