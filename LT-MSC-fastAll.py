@@ -7,6 +7,20 @@ import gc
 from scipy.linalg import solve
 from sklearn.utils.extmath import randomized_svd
 
+import psutil
+import os
+
+
+# === 新增内存监控辅助函数 ===
+def print_memory_usage(tag=""):
+    """
+    打印当前进程占用的物理内存 (RSS)
+    """
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    # 将字节转换为 GB
+    mem_gb = mem_info.rss / 1024 / 1024 / 1024
+    print(f"[{tag}] Current Memory: {mem_gb:.2f} GB")
 
 # ==========================================
 # 核心算法实现部分 (优化版)
@@ -106,6 +120,7 @@ def lt_msc(X_list, gt, lambda_val):
     """
     # 1. 强制转换为 Float32
     X = [x.astype(np.float32) for x in X_list]
+    print_memory_usage("Start")
 
     V_num = len(X)
     N = X[0].shape[1]
@@ -121,6 +136,8 @@ def lt_msc(X_list, gt, lambda_val):
 
     E = [np.zeros((d, N), dtype=np.float32) for d in D_list]
     Y = [np.zeros((d, N), dtype=np.float32) for d in D_list]
+
+    print_memory_usage("After Init")
 
     # 3. 预计算 Woodbury 矩阵 XX^T (D x D)，避免计算 N x N
     XXt_list = []
@@ -193,6 +210,9 @@ def lt_msc(X_list, gt, lambda_val):
             # 强制垃圾回收
             gc.collect()
 
+        # 在 Z 更新完后查看内存，确认是否释放回落
+        print_memory_usage(f"Iter {iter_idx} - After Z Update")
+
         # --- 2. Update E ---
         for k in range(V_num):
             XZ = np.dot(X[k], Z_tensor[:, :, k])
@@ -217,6 +237,8 @@ def lt_msc(X_list, gt, lambda_val):
         G_tensor = G_new
         W_tensor = W_new
         del G_new, W_new
+
+        print_memory_usage(f"Iter {iter_idx} - End")  # <--- 监控点 3：迭代结束
 
         # --- Update Params ---
         iter_idx += 1
